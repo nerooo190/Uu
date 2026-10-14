@@ -1,0 +1,15 @@
+Black Knight (Williams 1980) - browser port
+
+1. Start a local web server in this folder, e.g.:
+     python3 -m http.server 8000
+   (or: npx serve .)
+2. Open http://localhost:8000 in Chrome / Edge / Firefox.
+
+Keys: 5 coin, 1 start, Enter plunger (hold + release), Z and / flippers,
+A and ' magna-save, Q/E nudge, N advance (service), D debug overlay.
+
+Needs data/ and assets/ (created from your own .vpx with
+tools/vpx_extract.py, see README.md) and optionally rom/bk_l4.zip (your own
+game ROM). These are third-party works for personal use only; do not
+redistribute them. Without rom/bk_l4.zip the page falls back to simplified
+rules (?norom).
