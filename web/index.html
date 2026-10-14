@@ -28,11 +28,16 @@
   #lcd { display:none; width:100%; height:auto; border-radius:4px; border:1px solid #2a2530; }
   body.rom #lcd { display:block; }
   body.rom .plain { display:none; }
-  #romprompt { position:absolute; inset:0; z-index:5; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:24px; text-align:center; background:#000d; font-size:13px; line-height:1.5; }
-  #romprompt[hidden], #loading[hidden] { display:none; }
-  #romprompt label { cursor:pointer; padding:10px 16px; border:1px solid #6b5316; border-radius:8px; color:var(--gold); }
-  #romprompt button { background:none; border:none; color:var(--dim); text-decoration:underline; cursor:pointer; font:inherit; }
-  #romerr { color:var(--red); }
+  #setup { position:absolute; inset:0; z-index:5; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:24px; text-align:center; background:#000e; font-size:13px; line-height:1.5; }
+  #setup[hidden], #loading[hidden] { display:none; }
+  .setup-title { color:var(--gold); letter-spacing:.2em; text-transform:uppercase; font-size:15px; }
+  #setup label { cursor:pointer; padding:10px 16px; border:1px solid #6b5316; border-radius:8px; color:var(--gold); }
+  #setup button { font:inherit; cursor:pointer; padding:8px 22px; border-radius:8px; border:1px solid #6b5316; background:#3a2c0e; color:var(--gold); }
+  #setup button:disabled { opacity:.35; cursor:default; }
+  #setup button.link { background:none; border:none; color:var(--dim); text-decoration:underline; padding:0; }
+  .setup-state { display:flex; flex-direction:column; gap:4px; color:var(--dim); }
+  .setup-state .ok { color:#7ed69a; }
+  #setupErr { color:var(--red); min-height:1em; }
   #loading { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; background:#000c; color:var(--gold); font-size:14px; letter-spacing:.2em; }
   @media (max-width: 820px) { #hud { display:none; } #app { padding:0; } #touch { display:flex; } }
 </style>
@@ -45,11 +50,14 @@
       <button id="tL">LEFT</button><button id="tP">PLUNGER / START</button><button id="tR">RIGHT</button>
     </div>
     <div id="loading">LOADING</div>
-    <div id="romprompt" hidden>
-      <div>Drop the game ROM here (<b>bk_l4.zip</b>, MAME set) or choose it.<br>It stays in your browser and is never uploaded.</div>
-      <label>Choose ROM zip<input id="romfile" type="file" accept=".zip" hidden></label>
-      <div id="romerr"></div>
-      <button id="romskip">play without ROM (simplified rules)</button>
+    <div id="setup" hidden>
+      <div class="setup-title">Black Knight &ndash; setup</div>
+      <div>This page ships no table data and no game software. Add your own files; they stay in this browser and are never uploaded.</div>
+      <label>Choose files (.vpx and bk_l4.zip)<input id="setupFile" type="file" accept=".vpx,.zip" multiple hidden></label>
+      <div class="setup-state"><span id="setupVpx"></span><span id="setupRom"></span></div>
+      <div id="setupErr"></div>
+      <button id="setupGo" disabled>Start</button>
+      <button id="setupSkip" class="link">play without the game ROM (simplified rules)</button>
     </div>
   </div>
   <aside id="hud">

@@ -8,6 +8,7 @@ import { sound } from './audio.js';
 import { BALL_R, rad } from './geometry.js';
 import { loadRoms, createMachine, factoryInit, cmosToString, cmosFromString } from './s7/romboot.js';
 import { AudioOut } from './s7/audioout.js';
+import { parseVpx } from './vpx/vpx.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('c');
@@ -22,16 +23,16 @@ let debug = false;
 const params = new URLSearchParams(location.search);
 const audioOut = new AudioOut();
 
-async function loadImage(name) {
+function loadImage(src) {
   return new Promise((res) => {
     const img = new Image();
     img.onload = () => res(img);
     img.onerror = () => res(null);
-    img.src = `assets/${name}.webp`;
+    img.src = src;
   });
 }
 
-// ---- ROM storage (IndexedDB so a user-supplied ROM zip survives reloads) ----------------
+// ---- local storage (IndexedDB) for the files the player supplies -------------------------
 
 const idb = () => new Promise((res, rej) => {
   const rq = indexedDB.open('bk-port', 1);
@@ -45,43 +46,94 @@ async function kvGet(key) {
 async function kvSet(key, val) {
   try { const db = await idb(); await new Promise((res) => { const tx = db.transaction('kv', 'readwrite'); tx.objectStore('kv').put(val, key); tx.oncomplete = res; tx.onerror = res; }); } catch (e) { /* ignore */ }
 }
+const asBytes = (v) => (v ? new Uint8Array(v) : null);
 
-async function findRomZip() {
-  if (params.has('norom')) return null;
-  try { const r = await fetch('rom/bk_l4.zip'); if (r.ok) return new Uint8Array(await r.arrayBuffer()); } catch (e) { /* none */ }
-  const saved = await kvGet('rom');
-  return saved ? new Uint8Array(saved) : null;
+// Developer convenience: data/ and assets/ next to the page (made by tools/vpx_extract.py).
+async function localTable() {
+  if (params.has('setup')) return null;
+  try {
+    const r = await fetch('data/table.json');
+    if (!r.ok) return null;
+    const json = await r.json();
+    const imgs = await Promise.all(WANTED.map((n) => loadImage(`assets/${n}.webp`)));
+    return { json, imgs };
+  } catch (e) { return null; }
 }
 
-function askForRom() {
+async function localRom() {
+  if (params.has('norom') || params.has('setup')) return null;
+  try { const r = await fetch('rom/bk_l4.zip'); if (r.ok && /zip|octet/.test(r.headers.get('content-type') || 'zip')) return new Uint8Array(await r.arrayBuffer()); } catch (e) { /* none */ }
+  return null;
+}
+
+// Setup screen: the table (.vpx) and the game ROM (.zip) are supplied by the player and
+// stay in this browser; nothing is uploaded anywhere.
+function setupScreen(have) {
   return new Promise((resolve) => {
-    const box = $('romprompt');
-    box.hidden = false;
+    const state = { vpx: have.vpx, rom: have.rom, skipRom: false };
+    const box = $('setup');
     $('loading').hidden = true;
-    const done = async (file) => {
-      if (!file) { box.hidden = true; resolve(null); return; }
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      try { await loadRoms(bytes); } catch (e) { $('romerr').textContent = String(e.message || e); return; }
-      await kvSet('rom', bytes.buffer);
-      box.hidden = true; resolve(bytes);
+    box.hidden = false;
+    const refresh = () => {
+      $('setupVpx').textContent = state.vpx ? 'Table file: ready' : 'Table file (.vpx): missing';
+      $('setupVpx').className = state.vpx ? 'ok' : '';
+      $('setupRom').textContent = state.rom ? 'Game ROM: ready' : 'Game ROM (bk_l4.zip): optional';
+      $('setupRom').className = state.rom ? 'ok' : '';
+      $('setupGo').disabled = !state.vpx;
     };
-    $('romfile').onchange = (e) => done(e.target.files[0]);
-    $('romskip').onclick = () => done(null);
+    const take = async (files) => {
+      $('setupErr').textContent = '';
+      for (const f of files) {
+        const bytes = new Uint8Array(await f.arrayBuffer());
+        const name = f.name.toLowerCase();
+        try {
+          if (name.endsWith('.vpx')) { parseVpx(bytes); state.vpx = bytes; }
+          else if (name.endsWith('.zip')) { await loadRoms(bytes); state.rom = bytes; }
+          else throw new Error('Unknown file type: ' + f.name);
+        } catch (e) { $('setupErr').textContent = `${f.name}: ${e.message || e}`; }
+      }
+      refresh();
+    };
+    $('setupFile').onchange = (e) => take([...e.target.files]);
     box.ondragover = (e) => e.preventDefault();
-    box.ondrop = (e) => { e.preventDefault(); done(e.dataTransfer.files[0]); };
+    box.ondrop = (e) => { e.preventDefault(); take([...e.dataTransfer.files]); };
+    $('setupSkip').onclick = () => { state.skipRom = true; state.rom = null; refresh(); };
+    $('setupGo').onclick = () => { box.hidden = true; resolve(state); };
+    refresh();
   });
 }
 
 // ---- init -------------------------------------------------------------------------------
 
 async function init() {
-  const [json, ...imgs] = await Promise.all([fetch('data/table.json').then((r) => r.json()), ...WANTED.map(loadImage)]);
-  WANTED.forEach((n, i) => (IMAGES[n] = imgs[i]));
-  T = buildTable(json);
+  let source = await localTable();
+  let vpxBytes = null, romBytes = await localRom();
+  if (!source) {
+    vpxBytes = params.has('setup') ? null : asBytes(await kvGet('vpx'));
+    if (!romBytes && !params.has('norom') && !params.has('setup')) romBytes = asBytes(await kvGet('rom'));
+    const skipRom = params.has('norom') || !!(await kvGet('skiprom'));
+    if (!vpxBytes || (!romBytes && !skipRom)) {
+      const st = await setupScreen({ vpx: vpxBytes, rom: romBytes });
+      vpxBytes = st.vpx; romBytes = st.rom;
+      await kvSet('vpx', vpxBytes.buffer.slice(vpxBytes.byteOffset, vpxBytes.byteOffset + vpxBytes.byteLength));
+      if (romBytes) { await kvSet('rom', romBytes.buffer.slice(romBytes.byteOffset, romBytes.byteOffset + romBytes.byteLength)); await kvSet('skiprom', false); }
+      else await kvSet('skiprom', true);
+    }
+    $('loading').hidden = false;
+    $('loading').textContent = 'READING TABLE';
+    await new Promise((r) => setTimeout(r, 30));
+    const parsed = parseVpx(vpxBytes);
+    const imgs = await Promise.all(WANTED.map((n) => {
+      const im = parsed.images[n];
+      return im ? loadImage(URL.createObjectURL(new Blob([im.bytes], { type: im.mime }))) : null;
+    }));
+    source = { json: parsed.table, imgs };
+  }
+  WANTED.forEach((n, i) => (IMAGES[n] = source.imgs[i]));
+  T = buildTable(source.json);
   world = new World(T);
 
-  let zip = await findRomZip();
-  if (!zip && !params.has('norom')) zip = await askForRom();
+  const zip = params.has('norom') ? null : romBytes;
   if (zip) {
     try {
       const roms = await loadRoms(zip);

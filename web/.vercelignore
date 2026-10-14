@@ -1,0 +1,6 @@
+# Never deploy third-party content or local-only files
+data
+assets
+rom
+tests
+START.txt

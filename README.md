@@ -15,7 +15,20 @@ cd web && python -m http.server 8000                                          # 
 Keys: `1` start, `Enter` plunger (hold, release), `Z`/`←` and `/`/`→` flippers, `A` / `'` Magna-Save,
 `Q`/`E` nudge, `D` collision debug overlay. Touch buttons appear on small screens.
 
-Tests (need the extracted data): `node web/tests/rules.mjs`, `node web/tests/shots.mjs`, and with the ROM `node web/tests/rom.mjs`.
+Tests (need the extracted data; `node web/tests/vpx.mjs table.vpx` checks the browser reader against the Python extractor): `node web/tests/rules.mjs`, `node web/tests/shots.mjs`, and with the ROM `node web/tests/rom.mjs`.
+
+## Publishing (Vercel or any static host)
+
+The page is fully static and needs **no table data and no ROM on the server**: on first visit it shows a
+setup screen where the player chooses their own `.vpx` and (optionally) `bk_l4.zip`. Both are read in the browser
+(`web/js/vpx/` parses the OLE2 container and extracts layout and images) and kept in IndexedDB; nothing is uploaded.
+
+```bash
+cd web && npx vercel --prod      # framework: "Other", no build command, output = current folder
+```
+
+`web/.vercelignore` keeps `data/`, `assets/`, `rom/` and `tests/` out of the deployment even if they exist locally.
+`?setup` re-opens the setup screen, `?norom` forces the simplified rules.
 
 ## Running the real game ROM
 
@@ -43,7 +56,7 @@ Keys in ROM mode: `5` coin, `1` start (adds a coin if there are no credits), `N`
 
 ## Layout of the repo
 
-- `tools/vpx_extract.py` – reads the OLE2 `.vpx` container (items, images, script).
+- `tools/vpx_extract.py` – reads the OLE2 `.vpx` container (items, images, script) for local use; `web/js/vpx/` does the same in the browser.
 - `web/js/build.js` – turns the extracted items into collision segments, ramp surfaces and elements.
 - `web/js/physics.js` – ball physics. `web/js/game.js` – fallback rules. `web/js/main.js` – rendering and input.
 - `web/js/s7/` – System 7 emulation (`cpu6800.js`, `pia6821.js`, `s7machine.js`, `snd67.js`, `rom.js`); `web/js/cabinet.js` connects it to the table.
