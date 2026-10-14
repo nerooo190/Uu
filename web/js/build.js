@@ -174,10 +174,11 @@ export function buildTable(json) {
         T.plunger = { x: p.VCEN[0], y: 1805, width: F(p, 'WDTH', 25), travel: 70 };
         break;
       case 'Light': {
-        const c = I(p, 'COLR', 0xffffff);
+        const rgb = (c) => [c & 255, (c >> 8) & 255, (c >> 16) & 255];
         T.lights.push({
           name, x: p.VCEN[0], y: p.VCEN[1], r: F(p, 'RADI', 50),
-          color: [c & 255, (c >> 8) & 255, (c >> 16) & 255],
+          color: rgb(I(p, 'COL2', 0xffffff)), edge: rgb(I(p, 'COLR', 0xffffff)),
+          lamp: /^l(\d+)[a-z]?$/.test(name) ? +name.match(/^l(\d+)/)[1] : 0,
         });
         break;
       }

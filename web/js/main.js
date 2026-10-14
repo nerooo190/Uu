@@ -1,19 +1,26 @@
-// Browser entry: loads the extracted table, runs the fixed-step loop, draws it.
+// Browser entry: loads the extracted table, optionally boots the real game ROM
+// (System 7 emulation), runs the fixed-step loop and draws everything.
 import { buildTable } from './build.js';
 import { World } from './physics.js';
 import { Game } from './game.js';
+import { Cabinet } from './cabinet.js';
 import { sound } from './audio.js';
 import { BALL_R, rad } from './geometry.js';
+import { loadRoms, createMachine, factoryInit, cmosToString, cmosFromString } from './s7/romboot.js';
+import { AudioOut } from './s7/audioout.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('c');
 const ctx = canvas.getContext('2d');
+const lcd = $('lcd').getContext('2d');
 
 const IMAGES = {};
 const WANTED = ['pf', 'upperpf', 'pf-metals', 'plastics'];
-let T, world, game;
+let T, world, game, cab, machine;
+let romMode = false;
 let debug = false;
-const DEBUG_PARAM = new URLSearchParams(location.search);
+const params = new URLSearchParams(location.search);
+const audioOut = new AudioOut();
 
 async function loadImage(name) {
   return new Promise((res) => {
@@ -24,23 +31,101 @@ async function loadImage(name) {
   });
 }
 
+// ---- ROM storage (IndexedDB so a user-supplied ROM zip survives reloads) ----------------
+
+const idb = () => new Promise((res, rej) => {
+  const rq = indexedDB.open('bk-port', 1);
+  rq.onupgradeneeded = () => rq.result.createObjectStore('kv');
+  rq.onsuccess = () => res(rq.result);
+  rq.onerror = () => rej(rq.error);
+});
+async function kvGet(key) {
+  try { const db = await idb(); return await new Promise((res) => { const r = db.transaction('kv').objectStore('kv').get(key); r.onsuccess = () => res(r.result); r.onerror = () => res(null); }); } catch (e) { return null; }
+}
+async function kvSet(key, val) {
+  try { const db = await idb(); await new Promise((res) => { const tx = db.transaction('kv', 'readwrite'); tx.objectStore('kv').put(val, key); tx.oncomplete = res; tx.onerror = res; }); } catch (e) { /* ignore */ }
+}
+
+async function findRomZip() {
+  if (params.has('norom')) return null;
+  try { const r = await fetch('rom/bk_l4.zip'); if (r.ok) return new Uint8Array(await r.arrayBuffer()); } catch (e) { /* none */ }
+  const saved = await kvGet('rom');
+  return saved ? new Uint8Array(saved) : null;
+}
+
+function askForRom() {
+  return new Promise((resolve) => {
+    const box = $('romprompt');
+    box.hidden = false;
+    $('loading').hidden = true;
+    const done = async (file) => {
+      if (!file) { box.hidden = true; resolve(null); return; }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      try { await loadRoms(bytes); } catch (e) { $('romerr').textContent = String(e.message || e); return; }
+      await kvSet('rom', bytes.buffer);
+      box.hidden = true; resolve(bytes);
+    };
+    $('romfile').onchange = (e) => done(e.target.files[0]);
+    $('romskip').onclick = () => done(null);
+    box.ondragover = (e) => e.preventDefault();
+    box.ondrop = (e) => { e.preventDefault(); done(e.dataTransfer.files[0]); };
+  });
+}
+
+// ---- init -------------------------------------------------------------------------------
+
 async function init() {
-  const [json, ...imgs] = await Promise.all([
-    fetch('data/table.json').then((r) => r.json()),
-    ...WANTED.map(loadImage),
-  ]);
+  const [json, ...imgs] = await Promise.all([fetch('data/table.json').then((r) => r.json()), ...WANTED.map(loadImage)]);
   WANTED.forEach((n, i) => (IMAGES[n] = imgs[i]));
   T = buildTable(json);
   world = new World(T);
-  game = new Game(world, T, { sound });
-  window.__bk = { T, world, game };
+
+  let zip = await findRomZip();
+  if (!zip && !params.has('norom')) zip = await askForRom();
+  if (zip) {
+    try {
+      const roms = await loadRoms(zip);
+      let saved = null;
+      try { const s = localStorage.getItem('bk_cmos'); if (s) saved = cmosFromString(s); } catch (e) { /* ignore */ }
+      machine = createMachine(roms, saved);
+      if (!saved) await runFactoryInit();
+      cab = new Cabinet(world, T, machine);
+      cab.sounds = (n) => sound(n); // mechanical noises; the game's own sounds come from the emulated sound board
+      romMode = true;
+    } catch (e) { console.error(e); romMode = false; }
+  }
+  if (!romMode) game = new Game(world, T, { sound });
+  document.body.classList.toggle('rom', romMode);
+  window.__bk = { T, world, game, cab, machine, get romMode() { return romMode; } };
   bindInput();
   resize();
   addEventListener('resize', resize);
+  addEventListener('beforeunload', saveCmos);
+  setInterval(saveCmos, 5000);
   $('loading').remove();
-  if (DEBUG_PARAM.has('debug')) debug = true;
-  if (DEBUG_PARAM.has('autostart')) game.startGame();
+  if (params.has('debug')) debug = true;
+  if (params.has('autostart') && game) game.startGame();
   requestAnimationFrame(frame);
+}
+
+function runFactoryInit() {
+  return new Promise((resolve) => {
+    const gen = factoryInit(machine);
+    $('loading').hidden = false;
+    $('loading').textContent = 'FIRST START: RUNNING THE GAME\'S SELF TEST';
+    const step = () => {
+      const t0 = performance.now();
+      let r;
+      do { r = gen.next(); } while (!r.done && performance.now() - t0 < 12);
+      if (r.done) { saveCmos(); resolve(); } else requestAnimationFrame(step);
+    };
+    step();
+  });
+}
+
+function saveCmos() {
+  if (!machine) return;
+  try { localStorage.setItem('bk_cmos', cmosToString(machine.cmos)); } catch (e) { /* ignore */ }
 }
 
 function resize() {
@@ -50,7 +135,7 @@ function resize() {
   canvas.height = Math.max(400, Math.round(r.height * dpr));
 }
 
-// ---- input ------------------------------------------------------------------
+// ---- input ------------------------------------------------------------------------------
 
 const KEYS = {
   KeyZ: ['flip', 'L'], ArrowLeft: ['flip', 'L'], ShiftLeft: ['flip', 'L'],
@@ -60,54 +145,98 @@ const KEYS = {
   Enter: ['plunger'], Space: ['plunger'], ArrowDown: ['plunger'],
 };
 
+function credits() {
+  const d = (i) => { const v = machine.segments[i] & 0x7f; return [0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f].indexOf(v); };
+  const a = d(20), b = d(28);
+  return Math.max(0, a) * 10 + Math.max(0, b);
+}
+
+function startPressed() {
+  if (!romMode) { if (game.phase === 'attract') game.startGame(); return; }
+  if (credits() === 0) { cab.coin(); setTimeout(() => cab.start(), 600); } else cab.start();
+}
+
+function physicalNudge(dx) {
+  for (const b of world.balls) if (!b.held) { b.vx += dx * 220; b.vy -= 90; }
+  sound('nudge');
+}
+
 function bindInput() {
+  const flip = (side, down) => {
+    if (!romMode) { game.flipper(side, down); return; }
+    cab.flipper(side, down);
+    if (cab.flippersLive()) sound(down ? 'flipUp' : 'flipDown');
+  };
   addEventListener('keydown', (e) => {
     if (e.repeat) return;
-    if (e.code === 'Digit1' || e.code === 'Numpad1') { if (game.phase === 'attract') game.startGame(); return; }
+    audioOut.start();
+    if (e.code === 'Digit1' || e.code === 'Numpad1') { startPressed(); return; }
+    if (e.code === 'Digit5' || e.code === 'KeyC') { if (romMode) cab.coin(); return; }
     if (e.code === 'KeyD') { debug = !debug; return; }
-    if (e.code === 'KeyQ') { game.nudge(-1); return; }
-    if (e.code === 'KeyE') { game.nudge(1); return; }
+    if (e.code === 'KeyN' && romMode) { machine.special.advance = 1; return; }
+    if (e.code === 'KeyQ' || e.code === 'KeyE') {
+      const dx = e.code === 'KeyQ' ? -1 : 1;
+      if (romMode) { physicalNudge(dx); cab.nudge(); } else game.nudge(dx);
+      return;
+    }
     const k = KEYS[e.code];
     if (!k) return;
     e.preventDefault();
-    if (k[0] === 'flip') game.flipper(k[1], true);
-    else if (k[0] === 'magna') game.magnaKey(k[1], true);
-    else game.plunger(true);
+    if (k[0] === 'flip') flip(k[1], true);
+    else if (k[0] === 'magna') { if (romMode) cab.magna(k[1], true); else game.magnaKey(k[1], true); }
+    else if (romMode) world.pullPlunger(true); else game.plunger(true);
   });
   addEventListener('keyup', (e) => {
+    if (e.code === 'KeyN' && romMode) { machine.special.advance = 0; return; }
     const k = KEYS[e.code];
     if (!k) return;
-    if (k[0] === 'flip') game.flipper(k[1], false);
-    else if (k[0] === 'plunger') game.plunger(false);
+    if (k[0] === 'flip') flip(k[1], false);
+    else if (k[0] === 'magna') { if (romMode) cab.magna(k[1], false); }
+    else if (k[0] === 'plunger') { if (romMode) { world.pullPlunger(false); sound('plunger'); } else game.plunger(false); }
   });
   const hold = (id, down, up) => {
     const el = $(id);
-    el.addEventListener('pointerdown', (e) => { e.preventDefault(); down(); });
+    el.addEventListener('pointerdown', (e) => { e.preventDefault(); audioOut.start(); down(); });
     el.addEventListener('pointerup', up);
     el.addEventListener('pointerleave', up);
   };
-  hold('tL', () => game.flipper('L', true), () => game.flipper('L', false));
-  hold('tR', () => game.flipper('R', true), () => game.flipper('R', false));
-  hold('tP', () => { if (game.phase === 'attract') game.startGame(); else game.plunger(true); }, () => game.plunger(false));
+  hold('tL', () => flip('L', true), () => flip('L', false));
+  hold('tR', () => flip('R', true), () => flip('R', false));
+  hold('tP', () => {
+    const idle = romMode ? credits() === 0 || !machine.ssEn : game.phase === 'attract';
+    if (idle && !(romMode && machine.ssEn)) startPressed();
+    else if (romMode) world.pullPlunger(true); else game.plunger(true);
+  }, () => { if (romMode) world.pullPlunger(false); else game.plunger(false); });
 }
 
-// ---- loop -------------------------------------------------------------------
+// ---- loop -------------------------------------------------------------------------------
 
-let last = 0;
+let last = 0, acc = 0;
 function frame(ts) {
-  const dt = Math.min(0.05, last ? (ts - last) / 1000 : 0.016);
+  const dt = Math.min(0.1, last ? (ts - last) / 1000 : 0.016);
   last = ts;
-  world.step(dt);
-  game.update(dt);
+  if (romMode) {
+    acc += dt;
+    let n = 0;
+    while (acc >= 1 / 60 && n < 4) {
+      acc -= 1 / 60; n++;
+      const samples = machine.runFrame();
+      audioOut.push(samples);
+      world.step(1 / 60);
+      cab.update(1 / 60);
+    }
+    if (acc > 0.1) acc = 0;
+  } else {
+    world.step(dt);
+    game.update(dt);
+  }
   for (const b of T.bumpers) b.lit = Math.max(0, b.lit - dt * 6);
   draw();
   updateHud();
   requestAnimationFrame(frame);
 }
 
-// ---- drawing ----------------------------------------------------------------
-
-const lowerBlue = '#3b82f6', upperOrange = '#f59e0b';
+// ---- drawing ----------------------------------------------------------------------------
 
 function polyPath(poly) {
   ctx.beginPath();
@@ -121,9 +250,8 @@ function drawTable(img, alpha = 1) {
 
 function drawBall(b) {
   if (b.held) return;
-  const h = b.z / 80;                 // 0 lower level, 1 upper level
-  const ox = -h * 6, oy = -h * 10;    // slight parallax lift for the upper level
-  // shadow
+  const h = b.z / 80;
+  const ox = -h * 6, oy = -h * 10;
   ctx.fillStyle = 'rgba(0,0,0,0.35)';
   ctx.beginPath();
   ctx.ellipse(b.x + 8 + h * 10, b.y + 10 + h * 14, BALL_R, BALL_R * 0.92, 0, 0, 7);
@@ -138,7 +266,7 @@ function drawTarget(t) {
   ctx.beginPath();
   t.c.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
   ctx.closePath();
-  const left = t.x < T.width / 2 + 40 && t.sw !== 37 && t.sw !== 38 && t.sw !== 39 && t.sw < 31;
+  const left = [25, 26, 27, 33, 34, 35].includes(t.sw); // blue on the left banks, orange on the right
   if (t.dropped) { ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fill(); }
   else {
     ctx.fillStyle = left ? '#2a5fc8' : '#d98a14';
@@ -201,6 +329,24 @@ function drawPlunger() {
   ctx.fillRect(p.x - 15, p.y, 30, 10);
 }
 
+// light the playfield inserts the ROM switches on (lamp number == light name l<N>)
+function drawLamps() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const L of T.lights) {
+    if (!L.lamp || !cab.lampOn(L.lamp)) continue;
+    const r = L.r * 0.55;
+    const g = ctx.createRadialGradient(L.x, L.y, 0, L.x, L.y, r);
+    const c = L.color;
+    g.addColorStop(0, `rgba(${c[0]},${c[1]},${c[2]},0.75)`);
+    g.addColorStop(0.5, `rgba(${c[0]},${c[1]},${c[2]},0.28)`);
+    g.addColorStop(1, `rgba(${c[0]},${c[1]},${c[2]},0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(L.x, L.y, r, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
 function drawDebug() {
   ctx.lineWidth = 1.5;
   for (const s of T.segs) {
@@ -224,7 +370,6 @@ function draw() {
   for (const t of T.targets) if (t.z === 0 && lower(t.x, t.y)) drawTarget(t);
   for (const b of world.balls) if (b.z < 40) drawBall(b);
 
-  // upper playfield surface (the lower level runs underneath it)
   ctx.save();
   polyPath(T.plateau.poly);
   ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 24; ctx.shadowOffsetY = 10;
@@ -243,6 +388,13 @@ function draw() {
     ctx.save(); polyPath(v.poly); ctx.clip(); drawTable(IMAGES.plastics); ctx.restore();
   }
 
+  if (romMode) {
+    // the table is dim until the ROM lights its inserts; GI relay off = darker still
+    ctx.fillStyle = `rgba(0,0,0,${cab.gi ? 0.18 : 0.5})`;
+    ctx.fillRect(0, 0, T.width, T.height);
+    drawLamps();
+  }
+
   drawRamps();
   for (const t of T.targets) if (t.z > 0 || !lower(t.x, t.y)) drawTarget(t);
   for (const k of T.bumpers) drawBumper(k);
@@ -252,10 +404,52 @@ function draw() {
   if (debug) drawDebug();
 }
 
-// ---- HUD --------------------------------------------------------------------
+// ---- HUD --------------------------------------------------------------------------------
+
+function drawDigit(c, x, y, w, h, mask, on) {
+  const t = Math.max(2, w * 0.16);
+  const segs = [
+    [x + t, y, w - 2 * t, t], [x + w - t, y + t, t, h / 2 - t * 1.5], [x + w - t, y + h / 2 + t * 0.5, t, h / 2 - t * 1.5],
+    [x + t, y + h - t, w - 2 * t, t], [x, y + h / 2 + t * 0.5, t, h / 2 - t * 1.5], [x, y + t, t, h / 2 - t * 1.5],
+    [x + t, y + h / 2 - t / 2, w - 2 * t, t],
+  ];
+  segs.forEach((s, i) => { c.fillStyle = mask & (1 << i) ? on : 'rgba(255,120,40,0.07)'; c.fillRect(...s); });
+  if (mask & 0x80) { c.fillStyle = on; c.fillRect(x + w + 1, y + h - t, t, t); }
+}
+
+function drawLcd() {
+  const W = 260, H = 118;
+  lcd.clearRect(0, 0, W, H);
+  lcd.fillStyle = '#0a0503'; lcd.fillRect(0, 0, W, H);
+  const on = '#ff9a3c';
+  const dw = 11, dh = 20, gap = 4;
+  const row = (start, count, x0, y0) => { for (let i = 0; i < count; i++) drawDigit(lcd, x0 + i * (dw + gap), y0, dw, dh, machine.segments[start + i] || 0, on); };
+  // players: P1 (idx 1-7), P2 (9-15), P3 (21-27), P4 (29-35)
+  row(1, 7, 4, 10); row(9, 7, 138, 10);
+  row(21, 7, 4, 40); row(29, 7, 138, 40);
+  lcd.fillStyle = '#8a8394'; lcd.font = '10px ui-monospace, monospace';
+  lcd.fillText('P1', 4, 8); lcd.fillText('P2', 138, 8); lcd.fillText('P3', 4, 38); lcd.fillText('P4', 138, 38);
+  // ball in play + credits (status digits)
+  lcd.fillStyle = '#8a8394'; lcd.fillText('BALL', 4, 72); lcd.fillText('CREDITS', 138, 72);
+  drawDigit(lcd, 4, 78, dw, dh, machine.segments[0] || 0, on); drawDigit(lcd, 4 + dw + gap, 78, dw, dh, machine.segments[8] || 0, on);
+  drawDigit(lcd, 138, 78, dw, dh, machine.segments[20] || 0, on); drawDigit(lcd, 138 + dw + gap, 78, dw, dh, machine.segments[28] || 0, on);
+}
 
 let chipsKey = '';
 function updateHud() {
+  if (romMode) {
+    drawLcd();
+    const state = machine.ssEn ? 'GAME ON' : credits() > 0 ? 'PRESS 1 TO START' : 'PRESS 5 FOR A COIN, 1 TO START';
+    $('msg').textContent = state;
+    const chips = [
+      ['GI', cab.gi ? 'on' : ''], ['MAGNA L', machine.getSwitch(10) ? 'on' : ''], ['MAGNA R', machine.getSwitch(9) ? 'on' : ''],
+      [`TROUGH ${cab.troughCount}`, ''], [`LOCKED ${cab.locked.length}`, cab.locked.length ? 'on' : ''],
+      ['GAME ROM RUNNING', 'done'],
+    ];
+    const key = JSON.stringify(chips);
+    if (key !== chipsKey) { chipsKey = key; $('chips').innerHTML = chips.map(([t, c]) => `<span class="chip ${c}">${t}</span>`).join(''); }
+    return;
+  }
   $('score').textContent = game.score.toLocaleString('en-US');
   $('ball').textContent = game.phase === 'attract' ? '-' : `${game.ball} / 3`;
   $('high').textContent = game.high.toLocaleString('en-US');
@@ -263,19 +457,13 @@ function updateHud() {
   $('msg').textContent = game.message;
   const chips = [
     ...game.banks.map((b) => [`${b.id} ${b.hit.size}/3 (${b.done})`, b.hit.size ? 'on' : '']),
-    [`MAGNA L`, game.magna.L ? 'on' : ''],
-    [`MAGNA R`, game.magna.R ? 'on' : ''],
-    [`MYSTERY`, game.lit.mystery > 0 ? 'on' : ''],
-    [`SPINNER`, game.lit.spinner > 0 ? 'on' : ''],
+    [`MAGNA L`, game.magna.L ? 'on' : ''], [`MAGNA R`, game.magna.R ? 'on' : ''],
+    [`MYSTERY`, game.lit.mystery > 0 ? 'on' : ''], [`SPINNER`, game.lit.spinner > 0 ? 'on' : ''],
     [`LOCKS ${game.locked.length}/3`, game.locked.length ? 'on' : ''],
-    [game.multiball ? 'MULTIBALL' : 'MULTIBALL', game.multiball ? 'done' : ''],
-    [`EXTRA BALL`, game.lit.extraUpper || game.lit.extraLower ? 'on' : ''],
+    ['MULTIBALL', game.multiball ? 'done' : ''], [`EXTRA BALL`, game.lit.extraUpper || game.lit.extraLower ? 'on' : ''],
   ];
   const key = JSON.stringify(chips);
-  if (key !== chipsKey) {
-    chipsKey = key;
-    $('chips').innerHTML = chips.map(([t, c]) => `<span class="chip ${c}">${t}</span>`).join('');
-  }
+  if (key !== chipsKey) { chipsKey = key; $('chips').innerHTML = chips.map(([t, c]) => `<span class="chip ${c}">${t}</span>`).join(''); }
 }
 
 init();
